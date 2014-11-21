@@ -31,6 +31,7 @@ from oslo_utils import excutils
 from oslo_utils import units
 
 import glance_store
+from glance_store import capabilities
 from glance_store.common import utils
 import glance_store.driver
 from glance_store import exceptions
@@ -133,6 +134,9 @@ class ChunkedFile(object):
 
 class Store(glance_store.driver.Store):
 
+    _CAPABILITIES = (capabilities.READ_RANDOM |
+                     capabilities.WRITE_ACCESS |
+                     capabilities.DRIVER_REUSABLE)
     OPTIONS = _FILESYSTEM_CONFIGS
     READ_CHUNKSIZE = 64 * units.Ki
     WRITE_CHUNKSIZE = READ_CHUNKSIZE
@@ -364,6 +368,7 @@ class Store(glance_store.driver.Store):
                             'returned to the client.') % str(ex))
             return {}
 
+    @capabilities.check
     def get(self, location, offset=0, chunk_size=None, context=None):
         """
         Takes a `glance_store.location.Location` object that indicates
@@ -398,6 +403,7 @@ class Store(glance_store.driver.Store):
         LOG.debug(msg)
         return filesize
 
+    @capabilities.check
     def delete(self, location, context=None):
         """
         Takes a `glance_store.location.Location` object that indicates
@@ -468,6 +474,7 @@ class Store(glance_store.driver.Store):
 
         return best_datadir
 
+    @capabilities.check
     def add(self, image_id, image_file, image_size, context=None):
         """
         Stores an image file with supplied identifier to the backend
