@@ -17,6 +17,8 @@ import StringIO
 import urllib
 import urlparse
 
+import requests
+
 
 def sort_url_by_qs_keys(url):
     # NOTE(kragniz): this only sorts the keys of the query string of a url.
@@ -57,3 +59,14 @@ class FakeHTTPResponse(object):
 
     def read(self, amt):
         self.data.read(amt)
+
+    def release_conn(self):
+        pass
+
+
+def fake_response(status_code=200, headers=None, content=None):
+    r = requests.models.Response()
+    r.status_code = status_code
+    r.headers = headers or {}
+    r.raw = FakeHTTPResponse(status_code, headers, content)
+    return r

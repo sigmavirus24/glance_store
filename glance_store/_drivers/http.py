@@ -13,10 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import httplib
 import logging
 import socket
 import urlparse
+
+import requests
 
 from glance_store import capabilities
 import glance_store.driver
@@ -98,7 +99,7 @@ def http_response_iterator(conn, response, size):
     Return an iterator for a file-like object.
 
     :param conn: HTTP(S) Connection
-    :param response: httplib.HTTPResponse object
+    :param response: urllib3.HTTPResponse object
     :param size: Chunk size to iterate with
     """
     chunk = response.read(size)
@@ -125,13 +126,7 @@ class Store(glance_store.driver.Store):
         :param location `glance_store.location.Location` object, supplied
                         from glance_store.location.get_location_from_uri()
         """
-        try:
-            conn, resp, content_length = self._query(location, 'GET')
-        except socket.error:
-            reason = _LE("Remote server where the image is present "
-                         "is unavailable.")
-            LOG.error(reason)
-            raise exceptions.RemoteServiceUnavailable()
+        conn, resp, content_length = self._query(location, 'GET')
 
         iterator = http_response_iterator(conn, resp, self.READ_CHUNKSIZE)
 
@@ -157,10 +152,8 @@ class Store(glance_store.driver.Store):
         """
         try:
             size = self._query(location, 'HEAD')[2]
-        except socket.error:
-            reason = _("The HTTP URL is invalid.")
-            LOG.info(reason)
-            raise exceptions.BadStoreUri(message=reason)
+        except exceptions.BadStoreUri:
+            raise
         except exceptions.NotFound:
             raise
         except Exception:
@@ -169,54 +162,90 @@ class Store(glance_store.driver.Store):
             return 0
         return size
 
-    def _query(self, location, verb, depth=0):
-        if depth > MAX_REDIRECTS:
+    def _query(self, location, verb):
+        redirects_followed = 0
+
+        while redirects_followed < MAX_REDIRECTS:
+            loc = location.store_location
+
+            conn = self._get_response(loc, verb)
+
+            # NOTE(sigmavirus24): If it was generally successful, break early
+            if conn.status_code < 300:
+                break
+
+            self._check_store_uri(conn, loc)
+
+            redirects_followed += 1
+
+            # NOTE(sigmavirus24): Close the response so we don't leak sockets
+            conn.close()
+
+            location = self._new_location(location, conn.headers['location'])
+        else:
             reason = (_("The HTTP URL exceeded %s maximum "
                         "redirects.") % MAX_REDIRECTS)
             LOG.debug(reason)
             raise exceptions.MaxRedirectsExceeded(message=reason)
-        loc = location.store_location
-        conn_class = self._get_conn_class(loc)
-        conn = conn_class(loc.netloc)
-        conn.request(verb, loc.path, "", {})
-        resp = conn.getresponse()
 
+        resp = conn.raw
+
+        content_length = int(resp.getheader('content-length', 0))
+        return (conn, resp, content_length)
+
+    def _new_location(self, old_location, url):
+        store_name = old_location.store_name
+        store_class = old_location.store_location.__class__
+        image_id = old_location.image_id
+        store_specs = old_location.store_specs
+        return glance_store.location.Location(store_name,
+                                              store_class,
+                                              self.conf,
+                                              uri=url,
+                                              image_id=image_id,
+                                              store_specs=store_specs)
+
+    def _check_store_uri(self, conn, loc):
+        # TODO(sigmavirus24): Make this a staticmethod
         # Check for bad status codes
-        if resp.status >= 400:
-            if resp.status == httplib.NOT_FOUND:
+        if conn.status_code >= 400:
+            if conn.status_code == requests.codes.not_found:
                 reason = _("HTTP datastore could not find image at URI.")
                 LOG.debug(reason)
                 raise exceptions.NotFound(message=reason)
 
             reason = (_("HTTP URL %(url)s returned a "
                         "%(status)s status code.") %
-                      dict(url=loc.path, status=resp.status))
+                      {'url': loc.path, 'status': conn.status_code})
             LOG.debug(reason)
             raise exceptions.BadStoreUri(message=reason)
 
-        location_header = resp.getheader("location")
-        if location_header:
-            if resp.status not in (301, 302):
-                reason = (_("The HTTP URL %(url)s attempted to redirect "
-                            "with an invalid %(status)s status code.") %
-                          dict(url=loc.path, status=resp.status))
-                LOG.info(reason)
-                raise exceptions.BadStoreUri(message=reason)
-            location_class = glance_store.location.Location
-            new_loc = location_class(location.store_name,
-                                     location.store_location.__class__,
-                                     self.conf,
-                                     uri=location_header,
-                                     image_id=location.image_id,
-                                     store_specs=location.store_specs)
-            return self._query(new_loc, verb, depth + 1)
-        content_length = int(resp.getheader('content-length', 0))
-        return (conn, resp, content_length)
+        if conn.is_redirect and conn.status_code not in (301, 302):
+            reason = (_("The HTTP URL %(url)s attempted to redirect "
+                        "with an invalid %(status)s status code.") %
+                      {'url': loc.path, 'status': conn.status_code})
+            LOG.info(reason)
+            raise exceptions.BadStoreUri(message=reason)
 
-    def _get_conn_class(self, loc):
-        """
-        Returns connection class for accessing the resource. Useful
-        for dependency injection and stubouts in testing...
-        """
-        return {'http': httplib.HTTPConnection,
-                'https': httplib.HTTPSConnection}[loc.scheme]
+    def _handle_connection_error(self, error):
+        # TODO(sigmavirus24): Make this a staticmethod
+        exc = error.args[0]
+        if any(isinstance(e, socket.gaierror) for e in exc.args):
+            reason = _LE("Remote server where the image is present "
+                         "is unavailable.")
+            LOG.error(reason)
+            raise exceptions.RemoteServiceUnavailable(message=reason)
+        else:
+            reason = _("The HTTP URL is invalid.")
+            LOG.info(reason)
+            raise exceptions.BadStoreUri(message=reason)
+
+    def _get_response(self, location, verb):
+        if not hasattr(self, 'session'):
+            self.session = requests.Session()
+
+        try:
+            return self.session.request(verb, location.get_uri(), stream=True,
+                                        allow_redirects=False)
+        except requests.exceptions.ConnectionError as err:
+            self._handle_connection_error(err)
